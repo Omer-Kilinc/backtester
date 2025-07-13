@@ -5,7 +5,7 @@ from utils.logger import get_logger
 
 # TODO Ensure correctness of code
 
-from sdk.configs.walk_forward import WalkForwardSplitConfig
+from sdk.configs.data.walk_forward import WalkForwardSplitConfig
 
 def walk_forward_split(data, config: WalkForwardSplitConfig):
     """

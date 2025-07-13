@@ -6,7 +6,7 @@ from utils.logger import get_logger
 # TODO Ensure correctness of code
 # TODO Implement Critical Error cases, such as
 
-from sdk.configs.data_splitter import DataSplitterConfig
+from sdk.configs.data.splitting.data_splitter import DataSplitterConfig
 
 def split_data_by_time(df, config: DataSplitterConfig):
     """

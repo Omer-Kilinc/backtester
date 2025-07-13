@@ -29,7 +29,7 @@ def setup_logging(base_name: str = "app", level=logging.INFO, log_dir: str = "lo
     # Configure root logger
     logging.basicConfig(
         level=level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format='%(asctime)s - %(levelname)-8s - %(name)s.%(funcName)s:%(lineno)d - %(message)s',
         handlers=[
             logging.FileHandler(_log_file_path),
             # logging.StreamHandler()  

@@ -3,7 +3,7 @@ from datetime import datetime
 from pydantic import Field, field_validator, model_validator, ValidationInfo
 from enum import Enum
 import numpy as np
-from .base import BaseConfig
+from ..base import BaseConfig
 
 class SplitType(str, Enum):
     RATIO = "ratio"
