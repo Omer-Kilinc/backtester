@@ -39,6 +39,13 @@ class Strategy(abc.ABC):
         Called on each bar (i.e. after every new candle).
         Receives a pd.DataFrame including OHLCV and all computed indicator values
         up to and including the current bar.
+
+        Args:
+            data (pd.DataFrame): The data to process.
+
+        Returns:
+            List[TradeInstruction]: The trade instructions to execute.
+            None: If no trade instruction is to be executed.
         """
         
 
