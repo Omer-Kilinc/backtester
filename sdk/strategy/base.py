@@ -1,4 +1,8 @@
 import abc
+import pandas as pd
+from typing import List, Optional, Union
+from sdk.strategy.registry import INDICATOR_REGISTRY
+from sdk.configs.backtester.tradeinstruction import TradeInstruction
 
 class Strategy(abc.ABC):
     """
@@ -34,20 +38,18 @@ class Strategy(abc.ABC):
         pass
     
     @abc.abstractmethod
-    def on_bar(self, data: pd.DataFrame):
+    def on_bar(self, data: pd.DataFrame) -> Optional[Union[TradeInstruction, List[TradeInstruction]]]:
         """
         Called on each bar (i.e. after every new candle).
         Receives a pd.DataFrame including OHLCV and all computed indicator values
         up to and including the current bar.
 
         Args:
-            data (pd.DataFrame): The data to process.
+            data (pd.DataFrame): The data to process, including all historical data up to current bar.
 
         Returns:
-            List[TradeInstruction]: The trade instructions to execute.
+            TradeInstruction: A single trade instruction to execute.
+            List[TradeInstruction]: Multiple trade instructions to execute.
             None: If no trade instruction is to be executed.
         """
-        
-
-
-    
+        pass

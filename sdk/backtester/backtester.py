@@ -4,7 +4,9 @@ from sdk.strategy.base import Strategy
 from sdk.data.data_pipeline import DataPipelineConfig, DataPipeline
 from typing import TypeVar
 from logging import getLogger
-from sdk.strategy.indicators import INDICATOR_REGISTRY
+from sdk.strategy.registry import INDICATOR_REGISTRY
+import pandas as pd
+import numpy as np
 
 logger = getLogger(__name__)
 
@@ -42,8 +44,8 @@ class Backtester:
         if not (isinstance(strategy, Strategy) and type(strategy) != Strategy):
             # TODO: Remember the logger error issue
             logger.error(
-                f"`strategy` must be an instance of a subclass of `Strategy`, "
-                f"not `{type(strategy).__name__}` or `Strategy` directly."
+                f"'strategy' must be an instance of a subclass of 'Strategy', "
+                f"not '{type(strategy).__name__}' or 'Strategy' directly."
             )
             
         self.strategy = strategy
@@ -61,7 +63,23 @@ class Backtester:
         """
         Prepare the data for the backtest. 
         """
-        self.data = DataPipeline(self.data_pipeline_config).run_standard_pipeline()
+        result = DataPipeline(self.data_pipeline_config).run_standard_pipeline()
+        
+        # Handle different return types from pipeline
+        if isinstance(result, tuple):
+            # If we get (train_df, test_df), use training data
+            self.data = result[0]
+            logger.info("Using training data from pipeline split")
+        elif isinstance(result, pd.DataFrame):
+            # Single DataFrame
+            self.data = result
+            logger.info("Using single DataFrame from pipeline")
+        elif isinstance(result, str):
+            # File path - need to load it
+            self.data = pd.read_parquet(result)
+            logger.info(f"Loaded data from file: {result}")
+        else:
+            raise ValueError(f"Unexpected data type from pipeline: {type(result)}")
 
     def execute_backtest(self):
         """
@@ -80,17 +98,32 @@ class Backtester:
         for i in range(len(self.data)):
             # Need to check everything that occured between the previous bar close and current bar close
             # Firstly, check if any margin requirements have been met
-            pass
+            current_bar_data = self.data.iloc[:i+1]
+
+            self._process_intrabar_events(current_bar_data)
+            
 
                     
-                
-
-
-            
         
         logger.info("Backtest completed.")
         self.strategy.on_teardown()
     
+    def _process_intrabar_events(self, current_bar_data):
+
+        logger.debug(f"Processing intrabar events for bar with OHLC: {current_bar_data.iloc[-1]['open']:.2f}, {current_bar_data.iloc[-1]['high']:.2f}, {current_bar_data.iloc[-1]['low']:.2f}, {current_bar_data.iloc[-1]['close']:.2f}")
+
+        # Conserative approach involves:
+        # 1. Checking for margin requirements
+        
+        
+        # 2. Process Stop Losses
+        # 3. Process Take Profits
+        # 4. Process User set Exit Conditions (custom)
+        # 5. Process User set entry conditions like limit orders
+
+        return
+
+
     def precompute_indicators(self, progress_log_freq: float = 10.0):
         """
         Precompute indicators with adjustable progress logging.
