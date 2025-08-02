@@ -1,9 +1,9 @@
 from typing import Dict, List, Optional, Callable, Any, Union
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 import pandas as pd
 from pydantic import BaseModel, Field
-from sdk.configs.backtester.tradeinstruction import (  # Fixed import path
+from sdk.configs.backtester.tradeinstruction import (  
     OrderDirection, OrderType, TimeInForce, TradeInstruction, FailureReason
 )
 from utils.logger import get_logger
@@ -28,8 +28,8 @@ class Position:
     # Margin info
     is_margin: bool = False
     leverage: Optional[float] = None
-    margin_used: float = 0.0
-    initial_margin_req: float = 0.5 
+    initial_margin_req: float = 0.5
+    initial_margin_locked: Optional[float] = None 
     
     # Metadata
     metadata: Optional[Dict[str, Any]] = None
@@ -44,12 +44,6 @@ class Position:
     def get_market_value(self, current_price: float) -> float:
         """Get current market value of the position"""
         return self.quantity * current_price
-    
-    def get_unrealized_pnl_percent(self, current_price: float) -> float:
-        """Get unrealized PnL as percentage"""
-        entry_value = self.entry_price * self.quantity
-        unrealized_pnl = self.get_unrealized_pnl(current_price)
-        return (unrealized_pnl / entry_value) * 100 if entry_value != 0 else 0
     
 @dataclass
 class ExecutedTrade:
@@ -72,8 +66,9 @@ class PortfolioState(BaseModel):
     cash: float = Field(100_000.0, description="Available cash balance")
     initial_capital: float = Field(100_000.0, description="Starting capital")
     margin_requirement_rate: float = Field(0.5, description="Default margin requirement (50%)")
+    used_initial_margin: float = Field(0.0, description="Total margin currently locked for open positions")
     
-    # Positions and orders - Updated to use position IDs
+    # Positions and orders
     open_positions: Dict[str, Position] = Field(default_factory=dict, description="Active positions by position_id")
     pending_orders: Dict[str, TradeInstruction] = Field(default_factory=dict, description="Pending orders by order_id")
     
@@ -87,6 +82,23 @@ class PortfolioState(BaseModel):
     
     class Config:
         arbitrary_types_allowed = True
+
+    @property
+    def free_cash(self) -> float:
+        """Calculate free cash (cash - locked margin)"""
+        return self.cash - self.used_initial_margin
+    
+    def lock_margin(self, amount: float):
+        """Lock margin for a position"""
+        if self.free_cash < amount:
+            raise ValueError(f"Insufficient free cash to lock margin. Free: {self.free_cash:.2f}, Requested: {amount:.2f}")
+        self.used_initial_margin += amount
+
+    def unlock_margin(self, amount: float):
+        """Unlock margin from a closed position"""
+        self.used_initial_margin -= amount
+        if self.used_initial_margin < 0:
+            self.used_initial_margin = 0  # Safety check
 
     def liquidate_position(self, position_id: str, exit_price: float, reason: str, timestamp: datetime) -> bool:
         """
@@ -118,6 +130,10 @@ class PortfolioState(BaseModel):
             # Covering short - subtract cost from cash  
             self.cash -= position.quantity * exit_price
         
+        # Unlock margin that was locked for this position
+        if position.is_margin and position.initial_margin_locked:
+            self.unlock_margin(position.initial_margin_locked)
+        
         # Create trade record
         trade = ExecutedTrade(
             symbol=position.symbol,
@@ -137,28 +153,3 @@ class PortfolioState(BaseModel):
         
         logger.info(f"Liquidated {position.symbol} (ID: {position_id}) at {exit_price:.2f} due to {reason}. P&L: {realized_pnl:.2f}")
         return True
-
-    def get_positions_by_symbol(self, symbol: str) -> Dict[str, Position]:
-        """Get all open positions for a specific symbol"""
-        return {pos_id: position for pos_id, position in self.open_positions.items() 
-                if position.symbol == symbol}
-
-    def get_total_portfolio_value(self, current_prices: Dict[str, float]) -> float:
-        """Calculate total portfolio value (cash + positions)"""
-        total_value = self.cash
-        
-        for position in self.open_positions.values():
-            if position.symbol in current_prices:
-                total_value += position.get_market_value(current_prices[position.symbol])
-        
-        return total_value
-
-    def get_total_unrealized_pnl(self, current_prices: Dict[str, float]) -> float:
-        """Calculate total unrealized P&L across all positions"""
-        total_pnl = 0.0
-        
-        for position in self.open_positions.values():
-            if position.symbol in current_prices:
-                total_pnl += position.get_unrealized_pnl(current_prices[position.symbol])
-        
-        return total_pnl
