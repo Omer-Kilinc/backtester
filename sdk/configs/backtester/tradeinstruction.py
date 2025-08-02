@@ -1,8 +1,7 @@
 from datetime import datetime
-from typing import Optional, Callable, Union, Dict, Any
-from pydantic import BaseModel, Field
+from typing import Optional, Callable, Union, Dict, Any, Literal
+from pydantic import BaseModel, Field, model_validator, field_validator
 from enum import Enum
-from pydantic import model_validator, field_validator
 import pandas as pd
 
 class OrderDirection(Enum):
@@ -26,30 +25,36 @@ class FailureReason(Enum):
     InsufficientFunds = 'InsufficientFunds'
     InsufficientMargin = 'InsufficientMargin'
     GoodTillDateExpired = 'GoodTillDateExpired'
-    
 
 class TradeInstruction(BaseModel):
     """
-    TradeInstruction is a class that represents a trade instruction.
+    TradeInstruction represents a trade instruction with comprehensive order management.
 
     Attributes:
         direction (OrderDirection): The direction of the trade (buy or sell).
         order_type (OrderType): The type of the order (market, limit, stop, stop_limit).
         quantity (Optional[float]): The quantity of the asset to trade. Mutually exclusive with amount.
-        amount (Optional[float]): The amount of the asset to trade. Mutually exclusive with quantity.
+        amount (Optional[float]): The dollar amount to trade. Mutually exclusive with quantity.
         price (Optional[float]): The price at which to execute the order. Required for LIMIT or STOP_LIMIT orders.
         stop_price (Optional[float]): The stop price for the order. Required for STOP or STOP_LIMIT orders.
-        time_in_force (Optional[TimeInForce]): The time in force for the order. Defaults to GTC.
-        good_till_date (Optional[int]): The good till date for the order. Defaults to None. Candlestick count.
+        time_in_force (TimeInForce): The time in force for the order. Defaults to GTC.
+        good_till_date (Optional[int]): The good till date for the order (candlestick count). Required when time_in_force is GTD.
         target_price (Optional[float]): The target price for the order.
-        entry_stop_loss (Optional[float]): The entry stop loss for the order (absolute price).
-        entry_trailing_stop (Optional[float]): The entry trailing stop for the order (absolute price).
+        
+        # Exit-level conditions (applied after position is established)
         take_profit (Optional[Union[float, str]]): Absolute price (100) or percentage ('5%') for take profit.
         exit_stop_loss (Optional[Union[float, str]]): Absolute price (90) or percentage ('5%') for stop loss after entry.
         exit_trailing_stop (Optional[Union[float, str]]): Percentage ('5%') or absolute price for trailing stop after entry.
-        exit_condition (Optional[Callable[[pd.DataFrame, float], bool]]): The exit condition for the order. Takes in all the current market data and current position value, returns boolean indicating whether the order should be closed.
-        on_fail (Optional[Callable[[pd.DataFrame, TradeInstruction, FailureReason], None]]): The on fail callback for the order.
-        metadata (Optional[Dict[str, Any]]): Metadata for the order.
+        exit_condition (Optional[Callable]): Custom exit condition function.
+        
+        # Callbacks and metadata
+        on_fail (Optional[Callable]): Callback function called when order fails.
+        metadata (Optional[Dict[str, Any]]): Additional metadata for the order.
+        
+        # Margin trading
+        is_margin (bool): Whether this trade uses margin.
+        leverage (Optional[float]): Leverage ratio (e.g., 2 for 2:1). Only valid when is_margin=True.
+        margin_requirement (Optional[float]): Custom margin requirement. Only valid when is_margin=True.
     """
     direction: OrderDirection
     order_type: OrderType
@@ -57,15 +62,11 @@ class TradeInstruction(BaseModel):
     amount: Optional[float] = None  
     price: Optional[float] = None
     stop_price: Optional[float] = None
-    time_in_force: Optional[TimeInForce] = TimeInForce.GTC
-    good_till_date: Optional[int] = None  # Candlestick count # TODO: Change to good_till_candlestick_count?
+    time_in_force: TimeInForce = TimeInForce.GTC
+    good_till_date: Optional[int] = None  # Candlestick count
     target_price: Optional[float] = None
     
-    # Entry-level stops (used during order placement)
-    entry_stop_loss: Optional[float] = None
-    entry_trailing_stop: Optional[float] = None
-    
-    # Exit-level stops (used after position is established)
+    # Exit-level conditions (used after position is established)
     take_profit: Optional[Union[float, str]] = Field(
         None,
         description="Absolute price (100) or percentage ('5%') for take profit"
@@ -83,6 +84,7 @@ class TradeInstruction(BaseModel):
     on_fail: Optional[Callable[[pd.DataFrame, "TradeInstruction", FailureReason], None]] = None
     metadata: Optional[Dict[str, Any]] = None
 
+    # Margin trading
     is_margin: bool = Field(
         False,
         description="Whether this trade uses margin"
@@ -98,18 +100,16 @@ class TradeInstruction(BaseModel):
         gt=0.0, le=1.0
     )
 
-
-
     # Validators
     @field_validator("take_profit", "exit_stop_loss", "exit_trailing_stop")
     @classmethod
     def validate_price_or_percent(cls, v):
+        """Validate that exit conditions are either float or percentage string"""
         if v is None:
             return v
         if isinstance(v, (int, float)):
             return float(v)
         if isinstance(v, str) and v.endswith("%"):
-            # Keep as string for now, will be processed during execution
             try:
                 float(v.rstrip("%"))
                 return v
@@ -117,15 +117,25 @@ class TradeInstruction(BaseModel):
                 raise ValueError(f"Invalid percentage format: {v}")
         raise ValueError("Value must be a number or percentage string (e.g., '5%')")
 
-    @field_validator("quantity", "amount", "price", "stop_price", "target_price", "entry_stop_loss", "entry_trailing_stop")
+    @field_validator("quantity", "amount", "price", "stop_price", "target_price")
     @classmethod
     def must_be_positive(cls, v, info):
+        """Validate that numeric fields are positive"""
         if v is not None and v <= 0:
             raise ValueError(f"{info.field_name} must be positive")
         return v
 
+    @field_validator("good_till_date")
+    @classmethod
+    def validate_candlestick_count(cls, v):
+        """Validate that good_till_date is a positive integer"""
+        if v is not None and (not isinstance(v, int) or v <= 0):
+            raise ValueError("good_till_date must be a positive integer (candlestick count)")
+        return v
+
     @model_validator(mode="after")
     def validate_trade_instruction(self) -> "TradeInstruction":
+        """Validate the complete trade instruction"""
         # Enforce mutually exclusive amount and quantity
         if (self.amount is None and self.quantity is None) or (self.amount is not None and self.quantity is not None):
             raise ValueError("Specify exactly one of 'amount' or 'quantity'")
@@ -146,7 +156,7 @@ class TradeInstruction(BaseModel):
 
     @model_validator(mode="after")
     def validate_exit_conditions(self) -> "TradeInstruction":
-        """Validate exit conditions only when we have a reference price"""
+        """Validate exit conditions when we have a reference price"""
         # Only validate exit conditions for limit orders where we know the entry price
         if self.price is None:
             return self  # Skip validation for market orders
@@ -178,12 +188,16 @@ class TradeInstruction(BaseModel):
     
     @model_validator(mode="after")
     def validate_margin_params(self) -> "TradeInstruction":
+        """Validate margin-related parameters"""
         if self.is_margin:
             # Set default leverage if not specified
             if self.leverage is None:
                 self.leverage = 2.0  # Default 2:1 leverage
-        
-        elif self.leverage is not None:
-            raise ValueError("Leverage specified for non-margin trade")
+        else:
+            # Ensure no margin params are set for non-margin trades
+            if self.leverage is not None:
+                raise ValueError("Leverage cannot be specified for non-margin trades")
+            if self.margin_requirement is not None:
+                raise ValueError("Margin requirement cannot be specified for non-margin trades")
             
         return self
