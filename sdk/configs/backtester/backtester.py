@@ -88,7 +88,6 @@ class BacktesterConfig(BaseModel):
     def validate_short_selling_logic(self) -> "BacktesterConfig":
         """Validate short selling configuration"""
         if not self.allow_short_selling and self.require_margin_for_shorts:
-            # This is actually fine - shorts disabled completely
             pass
         
         return self
