@@ -1,5 +1,5 @@
 from typing import Dict, List, Optional, Callable, Any, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import pandas as pd
 from pydantic import BaseModel, Field
@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 
 @dataclass
 class Position:
-    """Represents an active position in the portfolio"""
+    """Represents an active position in the portfolio with enhanced exit condition support"""
     symbol: str
     direction: OrderDirection
     quantity: float
@@ -23,7 +23,13 @@ class Position:
     take_profit: Optional[Union[float, str]] = None
     exit_stop_loss: Optional[Union[float, str]] = None
     exit_trailing_stop: Optional[Union[float, str]] = None
-    exit_condition: Optional[Callable[[pd.DataFrame, float], bool]] = None
+    exit_condition: Optional[Callable[[pd.DataFrame, "Position", "PortfolioState"], Union[bool, float, dict, List[dict]]]] = None
+    
+    # Enhanced exit condition control
+    original_quantity: float = field(init=False)  # Track original position size
+    exit_condition_frequency: int = 1  # Check exit condition every N bars (1=every bar)
+    last_exit_check_bar: int = -1  # Track when exit condition was last checked
+    partial_closes: List[dict] = field(default_factory=list)  # History of partial closes
     
     # Margin info
     is_margin: bool = False
@@ -33,6 +39,10 @@ class Position:
     
     # Metadata
     metadata: Optional[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        """Set original_quantity after initialization"""
+        self.original_quantity = self.quantity
     
     def get_unrealized_pnl(self, current_price: float) -> float:
         """Calculate unrealized profit/loss at given price"""
@@ -45,6 +55,28 @@ class Position:
         """Get current market value of the position"""
         return self.quantity * current_price
     
+    def get_remaining_percentage(self) -> float:
+        """Get percentage of original position still remaining"""
+        if self.original_quantity == 0:
+            return 0.0
+        return self.quantity / self.original_quantity
+    
+    def add_partial_close(self, percentage: float, price: float, reason: str, timestamp: datetime):
+        """Record a partial close"""
+        self.partial_closes.append({
+            'timestamp': timestamp,
+            'percentage_closed': percentage,
+            'price': price,
+            'reason': reason,
+            'remaining_quantity': self.quantity
+        })
+    
+    def should_check_exit_condition(self, current_bar_index: int) -> bool:
+        """Check if exit condition should be evaluated this bar"""
+        if self.exit_condition is None:
+            return False
+        return (current_bar_index - self.last_exit_check_bar) >= self.exit_condition_frequency
+
 @dataclass
 class ExecutedTrade:
     """Simple record of a completed trade execution"""
@@ -58,9 +90,10 @@ class ExecutedTrade:
     commission: float = 0.0
     fees: float = 0.0
     position_id: Optional[str] = None  # Link to position ID
+    is_partial_close: bool = False  # True if this was a partial close
     
 class PortfolioState(BaseModel):
-    """Main portfolio state management"""
+    """Main portfolio state management with enhanced position tracking"""
     
     # Core balances
     cash: float = Field(100_000.0, description="Available cash balance")
@@ -80,6 +113,8 @@ class PortfolioState(BaseModel):
     # Counters for unique IDs
     position_counter: int = Field(0, description="Counter for generating unique position IDs")
     order_counter: int = Field(0, description="Counter for generating unique order IDs")
+
+    order_placement_bars: Dict[str, int] = Field(default_factory=dict, description="Track when orders were placed (bar index)")
     
     class Config:
         arbitrary_types_allowed = True
@@ -119,8 +154,8 @@ class PortfolioState(BaseModel):
     def execute_buy(self, symbol: str, quantity: float, price: float, timestamp: datetime,
                     is_margin: bool = False, leverage: float = None, margin_requirement: float = None,
                     take_profit=None, exit_stop_loss=None, exit_trailing_stop=None, 
-                    exit_condition=None, metadata=None, commission_rate: float = 0.001,
-                    slippage_rate: float = 0.001) -> str:
+                    exit_condition=None, exit_condition_frequency: int = 1, metadata=None, 
+                    commission_rate: float = 0.001, slippage_rate: float = 0.001) -> str:
         """
         Execute a buy order and create a new position.
         """
@@ -166,6 +201,7 @@ class PortfolioState(BaseModel):
             exit_stop_loss=exit_stop_loss,
             exit_trailing_stop=exit_trailing_stop,
             exit_condition=exit_condition,
+            exit_condition_frequency=exit_condition_frequency,
             is_margin=is_margin,
             leverage=leverage,
             initial_margin_req=margin_req_rate if is_margin else 0.0,
@@ -196,9 +232,9 @@ class PortfolioState(BaseModel):
     def execute_sell(self, symbol: str, quantity: float, price: float, timestamp: datetime,
                      is_margin: bool = False, leverage: float = None, margin_requirement: float = None,
                      take_profit=None, exit_stop_loss=None, exit_trailing_stop=None,
-                     exit_condition=None, metadata=None, commission_rate: float = 0.001,
-                     slippage_rate: float = 0.001, allow_short_selling: bool = True, 
-                     require_margin_for_shorts: bool = True) -> str:
+                     exit_condition=None, exit_condition_frequency: int = 1, metadata=None, 
+                     commission_rate: float = 0.001, slippage_rate: float = 0.001, 
+                     allow_short_selling: bool = True, require_margin_for_shorts: bool = True) -> str:
         """
         Execute a sell order and create a new short position.
         """
@@ -254,6 +290,7 @@ class PortfolioState(BaseModel):
             exit_stop_loss=exit_stop_loss,
             exit_trailing_stop=exit_trailing_stop,
             exit_condition=exit_condition,
+            exit_condition_frequency=exit_condition_frequency,
             is_margin=is_margin,
             leverage=leverage,
             initial_margin_req=margin_req_rate if is_margin else 0.0,
@@ -281,6 +318,96 @@ class PortfolioState(BaseModel):
         logger.info(f"Executed SELL (short): {quantity} {symbol} at {execution_price:.2f} → position {position_id}")
         logger.info(f"Locked {trade_value:.2f} short proceeds, {margin_needed:.2f} additional margin")
         return position_id
+
+    def close_position_partially(self, position_id: str, percentage: float, exit_price: float, 
+                                reason: str, timestamp: datetime, commission_rate: float = 0.001) -> bool:
+        """
+        Close a portion of a position.
+        
+        Args:
+            position_id: Position to partially close
+            percentage: Percentage to close (0.0 to 1.0)
+            exit_price: Exit price
+            reason: Reason for partial close
+            timestamp: Close timestamp
+            commission_rate: Commission rate
+            
+        Returns:
+            bool: True if successful
+        """
+        if position_id not in self.open_positions:
+            logger.error(f"Cannot partially close {position_id} - position not found")
+            return False
+        
+        if not 0 < percentage <= 1.0:
+            logger.error(f"Invalid percentage {percentage} - must be between 0 and 1")
+            return False
+        
+        position = self.open_positions[position_id]
+        close_quantity = position.quantity * percentage
+        
+        # Calculate commission and P&L
+        trade_value = close_quantity * exit_price
+        commission = trade_value * commission_rate
+        realized_pnl = close_quantity * (exit_price - position.entry_price)
+        if position.direction == OrderDirection.SELL:
+            realized_pnl = -realized_pnl  # Invert for short positions
+        
+        # Update cash based on position direction
+        if position.direction == OrderDirection.BUY:
+            # Closing long position: sell shares, add proceeds minus commission
+            net_proceeds = trade_value - commission
+            self.cash += net_proceeds
+        else:  # OrderDirection.SELL (short position)
+            # Closing short position: buy back shares plus commission
+            buyback_cost = trade_value + commission
+            self.cash -= buyback_cost
+            
+            # Unlock proportional short sale proceeds
+            if position.metadata and isinstance(position.metadata, dict):
+                total_short_proceeds = position.metadata.get('short_proceeds_locked', 0.0)
+                unlock_amount = total_short_proceeds * percentage
+                self.unlock_short_proceeds(unlock_amount)
+                position.metadata['short_proceeds_locked'] = total_short_proceeds - unlock_amount
+        
+        # Unlock proportional margin
+        if position.is_margin and position.initial_margin_locked:
+            unlock_margin = position.initial_margin_locked * percentage
+            self.unlock_margin(unlock_margin)
+            position.initial_margin_locked -= unlock_margin
+        
+        # Update position quantity
+        position.quantity -= close_quantity
+        
+        # Record the partial close
+        position.add_partial_close(percentage, exit_price, reason, timestamp)
+        
+        # Create trade record
+        trade = ExecutedTrade(
+            symbol=position.symbol,
+            direction=OrderDirection.SELL if position.direction == OrderDirection.BUY else OrderDirection.BUY,
+            quantity=close_quantity,
+            price=exit_price,
+            timestamp=timestamp,
+            is_entry=False,
+            realized_pnl=realized_pnl - commission,
+            commission=commission,
+            fees=0.0,
+            position_id=position_id,
+            is_partial_close=True
+        )
+        self.executed_trades.append(trade)
+        
+        logger.info(f"Partially closed {percentage*100:.1f}% of {position.symbol} (ID: {position_id}) "
+                   f"at {exit_price:.2f}. P&L: {realized_pnl:.2f}, Commission: {commission:.2f}")
+        
+        # If position is fully closed, move to history
+        if position.quantity <= 0.001:  # Account for floating point precision
+            self.closed_positions_history.append(position)
+            del self.open_positions[position_id]
+            logger.info(f"Position {position_id} fully closed")
+        
+        return True
 
     def validate_trade(self, direction: OrderDirection, quantity: float, price: float, 
                       is_margin: bool = False, leverage: float = None, margin_requirement: float = None,
@@ -366,50 +493,4 @@ class PortfolioState(BaseModel):
             logger.error(f"Cannot liquidate {position_id} - position not found")
             return False
         
-        position = self.open_positions[position_id]
-        
-        # Calculate realized P&L
-        realized_pnl = position.get_unrealized_pnl(exit_price)
-        
-        # Update cash based on position direction
-        if position.direction == OrderDirection.BUY:
-            # Closing long position: sell shares, add proceeds to cash
-            self.cash += position.quantity * exit_price
-        else:  # OrderDirection.SELL (short position)
-            # Closing short position: buy back shares to cover short
-            buyback_cost = position.quantity * exit_price
-            self.cash -= buyback_cost
-            
-            # Unlock short sale proceeds with safe metadata handling
-            if position.metadata and isinstance(position.metadata, dict):
-                short_proceeds = position.metadata.get('short_proceeds_locked', 0.0)
-                if short_proceeds > 0:
-                    self.unlock_short_proceeds(short_proceeds)
-                else:
-                    logger.warning(f"Position {position_id} missing short_proceeds_locked in metadata")
-            else:
-                logger.warning(f"Position {position_id} has invalid or missing metadata for short proceeds")
-        
-        # Unlock margin that was locked for this position
-        if position.is_margin and position.initial_margin_locked:
-            self.unlock_margin(position.initial_margin_locked)
-        
-        # Create trade record
-        trade = ExecutedTrade(
-            symbol=position.symbol,
-            direction=OrderDirection.SELL if position.direction == OrderDirection.BUY else OrderDirection.BUY,
-            quantity=position.quantity,
-            price=exit_price,
-            timestamp=timestamp,
-            is_entry=False,
-            realized_pnl=realized_pnl,
-            position_id=position_id
-        )
-        
-        # Update records
-        self.executed_trades.append(trade)
-        self.closed_positions_history.append(position)
-        del self.open_positions[position_id]
-        
-        logger.info(f"Liquidated {position.symbol} (ID: {position_id}) at {exit_price:.2f} due to {reason}. P&L: {realized_pnl:.2f}")
-        return True
+        return self.close_position_partially(position_id, 1.0, exit_price, reason, timestamp)

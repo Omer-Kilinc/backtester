@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional, Callable, Union, Dict, Any, Literal
+from typing import Optional, Callable, Union, Dict, Any, Literal, List
 from pydantic import BaseModel, Field, model_validator, field_validator
 from enum import Enum
 import pandas as pd
@@ -28,7 +28,8 @@ class FailureReason(Enum):
 
 class TradeInstruction(BaseModel):
     """
-    TradeInstruction represents a trade instruction with comprehensive order management.
+    TradeInstruction represents a trade instruction with comprehensive order management
+    and enhanced custom exit condition support.
 
     Attributes:
         direction (OrderDirection): The direction of the trade (buy or sell).
@@ -45,7 +46,8 @@ class TradeInstruction(BaseModel):
         take_profit (Optional[Union[float, str]]): Absolute price (100) or percentage ('5%') for take profit.
         exit_stop_loss (Optional[Union[float, str]]): Absolute price (90) or percentage ('5%') for stop loss after entry.
         exit_trailing_stop (Optional[Union[float, str]]): Percentage ('5%') or absolute price for trailing stop after entry.
-        exit_condition (Optional[Callable]): Custom exit condition function.
+        exit_condition (Optional[Callable]): Custom exit condition function with enhanced capabilities.
+        exit_condition_frequency (int): Check exit condition every N bars (1=every bar, 2=every 2 bars, etc.)
         
         # Callbacks and metadata
         on_fail (Optional[Callable]): Callback function called when order fails.
@@ -80,7 +82,17 @@ class TradeInstruction(BaseModel):
         description="Percentage ('5%') or absolute price for trailing stop after entry"
     )
     
-    exit_condition: Optional[Callable[[pd.DataFrame, float], bool]] = None
+    # Enhanced custom exit condition support
+    exit_condition: Optional[Callable[[pd.DataFrame, "Position", "PortfolioState"], Union[bool, float, dict, List[dict]]]] = Field(
+        None,
+        description="Custom exit condition function that can return multiple actions"
+    )
+    exit_condition_frequency: int = Field(
+        1,
+        description="Check exit condition every N bars (1=every bar, 2=every 2 bars, etc.)",
+        ge=1
+    )
+    
     on_fail: Optional[Callable[[pd.DataFrame, "TradeInstruction", FailureReason], None]] = None
     metadata: Optional[Dict[str, Any]] = None
 
@@ -131,6 +143,14 @@ class TradeInstruction(BaseModel):
         """Validate that good_till_date is a positive integer"""
         if v is not None and (not isinstance(v, int) or v <= 0):
             raise ValueError("good_till_date must be a positive integer (candlestick count)")
+        return v
+
+    @field_validator("exit_condition_frequency")
+    @classmethod
+    def validate_exit_condition_frequency(cls, v):
+        """Validate that exit_condition_frequency is a positive integer"""
+        if not isinstance(v, int) or v < 1:
+            raise ValueError("exit_condition_frequency must be a positive integer (minimum 1)")
         return v
 
     @model_validator(mode="after")
@@ -200,4 +220,12 @@ class TradeInstruction(BaseModel):
             if self.margin_requirement is not None:
                 raise ValueError("Margin requirement cannot be specified for non-margin trades")
             
+        return self
+
+    @model_validator(mode="after") 
+    def validate_exit_condition_logic(self) -> "TradeInstruction":
+        """Validate exit condition frequency is only set when exit condition exists"""
+        if self.exit_condition is None and self.exit_condition_frequency != 1:
+            raise ValueError("exit_condition_frequency can only be set when exit_condition is provided")
+        
         return self

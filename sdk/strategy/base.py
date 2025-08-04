@@ -13,14 +13,17 @@ class Strategy(abc.ABC):
         indicator_funcs (dict): Dictionary of indicator functions and their precompute status.
     """
     def __init__(self):
-        # Grab user-specified indicators to precompute from subclass
         precompute_list = getattr(self, 'precompute_indicators', [])
-
+        
         self.indicator_funcs = {}
         for name, info in INDICATOR_REGISTRY.items():
+            is_vectorized = info.get('vectorized', False)
+            user_wants_precompute = name in precompute_list
+            
             self.indicator_funcs[name] = {
                 'func': info['func'],
-                'precompute': name in precompute_list
+                'vectorized': is_vectorized,
+                'precompute': is_vectorized or user_wants_precompute
             }
     
     def on_init(self):

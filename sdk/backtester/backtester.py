@@ -3,7 +3,7 @@ from sdk.configs.backtester.backtester import BacktesterConfig
 from sdk.strategy.base import Strategy
 from sdk.data.data_pipeline import DataPipelineConfig, DataPipeline
 from sdk.configs.backtester.tradeinstruction import OrderDirection, OrderType, FailureReason
-from typing import TypeVar
+from typing import TypeVar, Union, List, Dict, Any
 from logging import getLogger
 from sdk.strategy.registry import INDICATOR_REGISTRY
 import pandas as pd
@@ -15,7 +15,7 @@ T = TypeVar('T', bound=Strategy)
 
 class Backtester:
     """
-    Backtester class for running backtests.
+    Backtester class for running backtests
 
     Attributes:
         strategy (Inherited from the Strategy class): The strategy to run the backtest on.
@@ -57,6 +57,16 @@ class Backtester:
         
         # Order management
         self.queued_market_orders = {}  # Orders to execute at next bar open
+        
+        # Supported exit condition actions
+        self.SUPPORTED_ACTIONS = {
+            'close': self._handle_close_action,
+            'update_stop': self._handle_update_stop_action,
+            'update_take_profit': self._handle_update_take_profit_action,
+            'update_trailing_stop': self._handle_update_trailing_stop_action,
+            'cancel_orders': self._handle_cancel_orders_action,
+            'place_order': self._handle_place_order_action
+        }
 
     def prepare_data(self):
         """
@@ -100,6 +110,9 @@ class Backtester:
             
             # Process intrabar events (margin, exits, pending order triggers)
             self._process_intrabar_events(current_bar_data)
+
+            # Compute live indicators for current bar before calling strategy
+            self._compute_live_indicators(current_bar_data, i)
             
             # Call strategy to get new trade instructions (at bar close)
             trade_instructions = self.strategy.on_bar(current_bar_data)
@@ -115,18 +128,309 @@ class Backtester:
         """Process all intrabar events in priority order"""
         logger.debug(f"Processing intrabar events for bar with OHLC: {current_bar_data.iloc[-1]['open']:.2f}, {current_bar_data.iloc[-1]['high']:.2f}, {current_bar_data.iloc[-1]['low']:.2f}, {current_bar_data.iloc[-1]['close']:.2f}")
 
-        # Conservative approach:
-        # 1. Checking for margin requirements
+        # Conservative approach - order matters:
+        # 1. Check margin requirements first (most critical)
         self._check_margin_requirements(current_bar_data)
         
-        # 2. Process Stop Losses
+        # 2. Process Stop Losses (risk management)
         self._process_stop_losses(current_bar_data)
 
-        # 3. Process Take Profits
+        # 3. Process Take Profits (profit taking)
         self._process_take_profits(current_bar_data)
         
-        # 4. Process User set Exit Conditions (custom)
-        # 5. Process User set entry conditions like limit orders
+        # 4. Process Custom Exit Conditions (user-defined logic)
+        self._process_custom_exit_conditions(current_bar_data)
+        
+        # 5. Process pending orders (limit/stop orders)
+        self._process_pending_orders(current_bar_data)
+
+    def _process_custom_exit_conditions(self, current_bar_data: pd.DataFrame):
+        """
+        Process custom exit conditions for all positions.
+        Supports multiple actions per position with robust error handling.
+        
+        Args:
+            current_bar_data: All historical data up to current bar
+        """
+        if not self.portfoliostate.open_positions:
+            return
+            
+        current_bar_index = len(current_bar_data) - 1
+        timestamp = current_bar_data['timestamp'].iloc[-1]
+        
+        # Create a copy of positions to iterate over (since we might modify the dict)
+        positions_to_check = list(self.portfoliostate.open_positions.items())
+        
+        for position_id, position in positions_to_check:
+            # Skip if position doesn't have exit condition or not time to check
+            if not position.should_check_exit_condition(current_bar_index):
+                continue
+            
+            try:
+                # Create read-only copies for safety (trust user but provide immutable-like access)
+                readonly_data = current_bar_data.copy()
+                readonly_position = position
+                readonly_portfolio = self.portfoliostate
+                
+                # Call user's exit condition function
+                result = position.exit_condition(readonly_data, readonly_position, readonly_portfolio)
+                
+                # Parse and validate the result
+                actions = self._parse_exit_condition_result(result)
+                
+                if actions:
+                    logger.debug(f"Position {position_id} exit condition returned {len(actions)} actions")
+                    
+                    # Execute all valid actions (skip failed ones, continue with others)
+                    for action in actions:
+                        try:
+                            self._execute_exit_action(position_id, action, current_bar_data, timestamp)
+                        except Exception as e:
+                            logger.error(f"Failed to execute action {action} for position {position_id}: {e}")
+                            # Continue with next action
+                
+                # Update last check bar (only if position still exists)
+                if position_id in self.portfoliostate.open_positions:
+                    self.portfoliostate.open_positions[position_id].last_exit_check_bar = current_bar_index
+                    
+            except Exception as e:
+                logger.error(f"Error in exit condition for position {position_id}: {e}")
+                # Continue backtesting with other positions
+
+    def _parse_exit_condition_result(self, result: Union[bool, float, dict, List[dict]]) -> List[dict]:
+        """
+        Parse the result from an exit condition function into a list of actions.
+        
+        Args:
+            result: Return value from exit condition function
+            
+        Returns:
+            List[dict]: List of validated action dictionaries
+        """
+        if result is None or result is False:
+            return []
+        
+        actions = []
+        
+        if result is True:
+            # Simple close entire position
+            actions.append({'action': 'close', 'percentage': 1.0, 'reason': 'Exit condition triggered'})
+            
+        elif isinstance(result, (int, float)):
+            # Percentage close
+            if 0 < result <= 1:
+                actions.append({'action': 'close', 'percentage': float(result), 'reason': 'Partial exit condition'})
+            else:
+                logger.error(f"Invalid percentage {result} - must be between 0 and 1")
+                
+        elif isinstance(result, dict):
+            # Single action dictionary
+            if self._validate_action(result):
+                actions.append(result)
+                
+        elif isinstance(result, list):
+            # Multiple actions
+            for action in result:
+                if isinstance(action, dict) and self._validate_action(action):
+                    actions.append(action)
+                else:
+                    logger.error(f"Invalid action in list: {action}")
+        else:
+            logger.error(f"Unsupported exit condition result type: {type(result)}")
+            
+        return actions
+
+    def _validate_action(self, action: dict) -> bool:
+        """
+        Validate an action dictionary.
+        
+        Args:
+            action: Action dictionary to validate
+            
+        Returns:
+            bool: True if action is valid
+        """
+        if not isinstance(action, dict):
+            return False
+            
+        action_type = action.get('action')
+        if action_type not in self.SUPPORTED_ACTIONS:
+            logger.error(f"Unsupported action type: {action_type}")
+            return False
+        
+        # Validate action-specific parameters
+        if action_type == 'close':
+            percentage = action.get('percentage', 1.0)
+            if not isinstance(percentage, (int, float)) or not 0 < percentage <= 1:
+                logger.error(f"Invalid close percentage: {percentage}")
+                return False
+                
+        elif action_type in ['update_stop', 'update_take_profit', 'update_trailing_stop']:
+            price_key = {
+                'update_stop': 'new_stop',
+                'update_take_profit': 'new_tp',
+                'update_trailing_stop': 'new_trailing'
+            }[action_type]
+            
+            if price_key not in action:
+                logger.error(f"Missing {price_key} for {action_type}")
+                return False
+                
+        elif action_type == 'place_order':
+            if 'instruction' not in action:
+                logger.error("Missing 'instruction' for place_order action")
+                return False
+        
+        return True
+
+    def _execute_exit_action(self, position_id: str, action: dict, current_bar_data: pd.DataFrame, timestamp):
+        """
+        Execute a single exit action.
+        
+        Args:
+            position_id: Position ID to act on
+            action: Action dictionary
+            current_bar_data: Current bar data
+            timestamp: Current timestamp
+        """
+        if position_id not in self.portfoliostate.open_positions:
+            logger.warning(f"Position {position_id} not found for action {action}")
+            return
+            
+        action_type = action['action']
+        action_handler = self.SUPPORTED_ACTIONS.get(action_type)
+        
+        if action_handler:
+            action_handler(position_id, action, current_bar_data, timestamp)
+        else:
+            logger.error(f"No handler for action type: {action_type}")
+
+    def _handle_close_action(self, position_id: str, action: dict, current_bar_data: pd.DataFrame, timestamp):
+        """Handle close position action"""
+        percentage = action.get('percentage', 1.0)
+        reason = action.get('reason', 'Custom exit condition')
+        
+        # Use current close price for exit
+        current_price = current_bar_data.iloc[-1]['close']
+        
+        success = self.portfoliostate.close_position_partially(
+            position_id=position_id,
+            percentage=percentage,
+            exit_price=current_price,
+            reason=reason,
+            timestamp=timestamp,
+            commission_rate=self.config.commission_rate
+        )
+        
+        if success:
+            logger.info(f"Executed close action: {percentage*100:.1f}% of position {position_id}")
+        else:
+            logger.error(f"Failed to close position {position_id}")
+
+    def _handle_update_stop_action(self, position_id: str, action: dict, current_bar_data: pd.DataFrame, timestamp):
+        """Handle update stop loss action"""
+        new_stop = action.get('new_stop')
+        position = self.portfoliostate.open_positions[position_id]
+        
+        # Validate new stop makes sense
+        current_price = current_bar_data.iloc[-1]['close']
+        
+        if isinstance(new_stop, str) and new_stop.endswith('%'):
+            # Convert percentage to absolute price
+            percent = float(new_stop.rstrip('%')) / 100
+            if position.direction == OrderDirection.BUY:
+                new_stop = position.entry_price * (1 - percent)
+            else:
+                new_stop = position.entry_price * (1 + percent)
+        
+        # Basic validation
+        if position.direction == OrderDirection.BUY and new_stop >= current_price:
+            logger.warning(f"Invalid stop loss {new_stop} for long position at {current_price}")
+            return
+        elif position.direction == OrderDirection.SELL and new_stop <= current_price:
+            logger.warning(f"Invalid stop loss {new_stop} for short position at {current_price}")
+            return
+        
+        # Update the stop loss
+        old_stop = position.exit_stop_loss
+        position.exit_stop_loss = new_stop
+        
+        logger.info(f"Updated stop loss for position {position_id}: {old_stop} → {new_stop}")
+
+    def _handle_update_take_profit_action(self, position_id: str, action: dict, current_bar_data: pd.DataFrame, timestamp):
+        """Handle update take profit action"""
+        new_tp = action.get('new_tp')
+        position = self.portfoliostate.open_positions[position_id]
+        
+        # Validate new take profit makes sense
+        current_price = current_bar_data.iloc[-1]['close']
+        
+        if isinstance(new_tp, str) and new_tp.endswith('%'):
+            # Convert percentage to absolute price
+            percent = float(new_tp.rstrip('%')) / 100
+            if position.direction == OrderDirection.BUY:
+                new_tp = position.entry_price * (1 + percent)
+            else:
+                new_tp = position.entry_price * (1 - percent)
+        
+        # Basic validation
+        if position.direction == OrderDirection.BUY and new_tp <= current_price:
+            logger.warning(f"Invalid take profit {new_tp} for long position at {current_price}")
+            return
+        elif position.direction == OrderDirection.SELL and new_tp >= current_price:
+            logger.warning(f"Invalid take profit {new_tp} for short position at {current_price}")
+            return
+        
+        # Update the take profit
+        old_tp = position.take_profit
+        position.take_profit = new_tp
+        
+        logger.info(f"Updated take profit for position {position_id}: {old_tp} → {new_tp}")
+
+    def _handle_update_trailing_stop_action(self, position_id: str, action: dict, current_bar_data: pd.DataFrame, timestamp):
+        """Handle update trailing stop action"""
+        new_trailing = action.get('new_trailing')
+        position = self.portfoliostate.open_positions[position_id]
+        
+        # Update the trailing stop
+        old_trailing = position.exit_trailing_stop
+        position.exit_trailing_stop = new_trailing
+        
+        logger.info(f"Updated trailing stop for position {position_id}: {old_trailing} → {new_trailing}")
+
+    def _handle_cancel_orders_action(self, position_id: str, action: dict, current_bar_data: pd.DataFrame, timestamp):
+        """Handle cancel orders action"""
+        # Find and cancel any pending orders related to this position
+        orders_to_cancel = []
+        
+        for order_id, order in self.portfoliostate.pending_orders.items():
+            # Match orders by metadata or other criteria
+            if order.metadata and order.metadata.get('position_id') == position_id:
+                orders_to_cancel.append(order_id)
+        
+        for order_id in orders_to_cancel:
+            del self.portfoliostate.pending_orders[order_id]
+            logger.info(f"Cancelled order {order_id} for position {position_id}")
+
+    def _handle_place_order_action(self, position_id: str, action: dict, current_bar_data: pd.DataFrame, timestamp):
+        """Handle place new order action"""
+        instruction = action.get('instruction')
+        
+        if not instruction:
+            logger.error("No instruction provided for place_order action")
+            return
+        
+        # Add position reference to metadata
+        if not instruction.metadata:
+            instruction.metadata = {}
+        instruction.metadata['related_position_id'] = position_id
+        
+        # Process the new trade instruction
+        try:
+            self._process_trade_instructions([instruction], current_bar_data)
+            logger.info(f"Placed new order for position {position_id}")
+        except Exception as e:
+            logger.error(f"Failed to place order for position {position_id}: {e}")
 
     def _check_margin_requirements(self, current_bar_data: pd.DataFrame):
         """
@@ -433,62 +737,14 @@ class Backtester:
         Returns:
             bool: True if successful, False if position not found
         """
-        if position_id not in self.portfoliostate.open_positions:
-            logger.error(f"Cannot close {position_id} - position not found")
-            return False
-        
-        position = self.portfoliostate.open_positions[position_id]
-        
-        # Calculate commission on exit trade
-        trade_value = position.quantity * exit_price
-        commission = self.config.calculate_commission(trade_value)
-        
-        # Calculate realized P&L before commission
-        realized_pnl = position.get_unrealized_pnl(exit_price)
-        
-        # Update cash based on position direction
-        if position.direction == OrderDirection.BUY:
-            # Closing long position: sell shares, add proceeds minus commission
-            net_proceeds = (position.quantity * exit_price) - commission
-            self.portfoliostate.cash += net_proceeds
-        else:  # OrderDirection.SELL (short position)
-            # Closing short position: buy back shares plus commission
-            buyback_cost = (position.quantity * exit_price) + commission
-            self.portfoliostate.cash -= buyback_cost
-            
-            # Unlock short sale proceeds
-            if position.metadata and isinstance(position.metadata, dict):
-                short_proceeds = position.metadata.get('short_proceeds_locked', 0.0)
-                if short_proceeds > 0:
-                    self.portfoliostate.unlock_short_proceeds(short_proceeds)
-        
-        # Unlock margin that was locked for this position
-        if position.is_margin and position.initial_margin_locked:
-            self.portfoliostate.unlock_margin(position.initial_margin_locked)
-        
-        # Create trade record with commission
-        from sdk.backtester.portfoliostate import ExecutedTrade
-        trade = ExecutedTrade(
-            symbol=position.symbol,
-            direction=OrderDirection.SELL if position.direction == OrderDirection.BUY else OrderDirection.BUY,
-            quantity=position.quantity,
-            price=exit_price,
+        return self.portfoliostate.close_position_partially(
+            position_id=position_id,
+            percentage=1.0,
+            exit_price=exit_price,
+            reason=reason,
             timestamp=timestamp,
-            is_entry=False,
-            realized_pnl=realized_pnl - commission,  # Subtract commission from P&L
-            commission=commission,
-            fees=0.0,
-            position_id=position_id
+            commission_rate=self.config.commission_rate
         )
-        
-        # Update records
-        self.portfoliostate.executed_trades.append(trade)
-        self.portfoliostate.closed_positions_history.append(position)
-        del self.portfoliostate.open_positions[position_id]
-        
-        logger.info(f"Closed position {position.symbol} (ID: {position_id}) at {exit_price:.2f} due to {reason}. "
-                   f"P&L: {realized_pnl:.2f}, Commission: {commission:.2f}, Net P&L: {realized_pnl - commission:.2f}")
-        return True
 
     def _get_stop_loss_price(self, position) -> Optional[float]:
         """
@@ -577,6 +833,7 @@ class Backtester:
                         exit_stop_loss=instruction.exit_stop_loss,
                         exit_trailing_stop=instruction.exit_trailing_stop,
                         exit_condition=instruction.exit_condition,
+                        exit_condition_frequency=getattr(instruction, 'exit_condition_frequency', 1),
                         metadata=instruction.metadata,
                         commission_rate=self.config.commission_rate,
                         slippage_rate=self.config.slippage_model
@@ -594,6 +851,7 @@ class Backtester:
                         exit_stop_loss=instruction.exit_stop_loss,
                         exit_trailing_stop=instruction.exit_trailing_stop,
                         exit_condition=instruction.exit_condition,
+                        exit_condition_frequency=getattr(instruction, 'exit_condition_frequency', 1),
                         metadata=instruction.metadata,
                         commission_rate=self.config.commission_rate,
                         slippage_rate=self.config.slippage_model,
@@ -641,6 +899,7 @@ class Backtester:
                 logger.error(f"Failed to process trade instruction: {e}")
                 self._handle_order_failure(instruction, str(e), current_bar_data)
 
+
     def _queue_market_order(self, instruction):
         """
         Queue a market order for execution at next bar open.
@@ -654,6 +913,7 @@ class Backtester:
         self.queued_market_orders[order_id] = instruction
         logger.debug(f"Queued market order {order_id} for next bar open")
 
+
     def _add_to_pending_orders(self, instruction):
         """
         Add a limit/stop order to pending orders.
@@ -663,6 +923,9 @@ class Backtester:
         """
         order_id = f"pending_{self.portfoliostate.order_counter}"
         self.portfoliostate.order_counter += 1
+        
+        current_bar_index = len(self.data) - 1 if self.data is not None else 0
+        self.portfoliostate.order_placement_bars[order_id] = current_bar_index
         
         self.portfoliostate.pending_orders[order_id] = instruction
         logger.debug(f"Added {instruction.order_type.value} order {order_id} to pending orders")
@@ -730,14 +993,19 @@ class Backtester:
         
         Args:
             progress_log_freq: Percentage (0-100) for progress updates. 
-                          0 = off, 10 = every 10% (default), 100 = every indicator.
+                        0 = off, 10 = every 10% (default), 100 = every indicator.
         """
         logger.info("Precomputing indicators...")
-    
+
+        # Use strategy's indicator configuration instead of global registry
         indicators = {
-            name: info for name, info in INDICATOR_REGISTRY.items() 
-            if info.get('precompute')
+            name: info for name, info in self.strategy.indicator_funcs.items() 
+            if info.get('precompute', False)
         }
+        
+        if not indicators:
+            logger.info("No indicators to precompute")
+            return
         
         # Initialize all columns at once
         self.data = self.data.assign(**{name: np.nan for name in indicators})
@@ -767,3 +1035,328 @@ class Backtester:
             except Exception as e:
                 logger.error(f"Failed computing {name}: {str(e)}")
                 continue
+    
+
+    def _process_pending_orders(self, current_bar_data: pd.DataFrame):
+        """
+        Process all pending orders at bar close.
+        Handle expiration, triggering, and execution in FIFO order.
+        
+        Args:
+            current_bar_data: All historical data up to current bar
+        """
+        if not self.portfoliostate.pending_orders:
+            return
+            
+        # Step 1: Remove expired orders first
+        self._expire_pending_orders(current_bar_data)
+        
+        if not self.portfoliostate.pending_orders:
+            return
+            
+        # Step 2: Get current bar info
+        current_bar = current_bar_data.iloc[-1]
+        timestamp = current_bar_data['timestamp'].iloc[-1]
+        
+        # Step 3: Process orders in FIFO order (by order_id which includes counter)
+        orders_to_remove = []
+        orders_to_modify = []  # For STOP_LIMIT conversions
+        
+        # Sort by order ID to maintain FIFO (order_counter ensures chronological order)
+        for order_id in sorted(self.portfoliostate.pending_orders.keys()):
+            instruction = self.portfoliostate.pending_orders[order_id]
+            
+            # Check if order should trigger
+            triggered, execution_price = self._check_order_trigger(instruction, current_bar)
+            
+            if triggered:
+                if instruction.order_type == OrderType.STOP_LIMIT:
+                    # Convert to LIMIT order, don't execute yet
+                    new_instruction = self._convert_stop_limit_to_limit(instruction)
+                    orders_to_modify.append((order_id, new_instruction))
+                    logger.info(f"STOP_LIMIT order {order_id} stop triggered, converted to LIMIT order")
+                else:
+                    # Try to execute the order
+                    success = self._execute_pending_order(instruction, execution_price, timestamp, current_bar_data)
+                    if success:
+                        orders_to_remove.append(order_id)
+                        logger.info(f"Executed pending order {order_id} at {execution_price:.2f}")
+                    else:
+                        logger.debug(f"Pending order {order_id} triggered but failed validation - keeping in queue")
+                    # If failed validation, keep in pending orders
+        
+        # Step 4: Apply modifications and removals
+        for order_id in orders_to_remove:
+            del self.portfoliostate.pending_orders[order_id]
+            if order_id in self.portfoliostate.order_placement_bars:
+                del self.portfoliostate.order_placement_bars[order_id]
+            
+        for order_id, new_instruction in orders_to_modify:
+            self.portfoliostate.pending_orders[order_id] = new_instruction
+            # Keep same placement bar for expiration tracking
+
+    def _expire_pending_orders(self, current_bar_data: pd.DataFrame):
+        """
+        Remove expired orders from pending queue.
+        
+        Args:
+            current_bar_data: All historical data up to current bar
+        """
+        current_bar_index = len(current_bar_data) - 1
+        orders_to_remove = []
+        
+        for order_id, instruction in self.portfoliostate.pending_orders.items():
+            if instruction.time_in_force == TimeInForce.GTD:
+                placement_bar = self.portfoliostate.order_placement_bars.get(order_id, 0)
+                bars_since_placement = current_bar_index - placement_bar
+                
+                if bars_since_placement >= instruction.good_till_date:
+                    orders_to_remove.append(order_id)
+                    logger.info(f"Order {order_id} expired after {bars_since_placement} bars (GTD: {instruction.good_till_date})")
+            
+            # TODO: Implement DAY order expiration
+            # elif instruction.time_in_force == TimeInForce.DAY:
+            #     # Check if we've crossed a trading day boundary
+            #     pass
+        
+        # Remove expired orders
+        for order_id in orders_to_remove:
+            del self.portfoliostate.pending_orders[order_id]
+            if order_id in self.portfoliostate.order_placement_bars:
+                del self.portfoliostate.order_placement_bars[order_id]
+
+    def _check_order_trigger(self, instruction, current_bar) -> tuple[bool, float]:
+        """
+        Determine if a pending order should trigger based on current bar OHLC.
+        
+        Args:
+            instruction: TradeInstruction to check
+            current_bar: Current bar data with OHLC
+            
+        Returns:
+            tuple[bool, float]: (triggered, execution_price)
+        """
+        triggered = False
+        execution_price = 0.0
+        
+        if instruction.order_type == OrderType.LIMIT:
+            if instruction.direction == OrderDirection.BUY:
+                # LIMIT BUY: Trigger when price goes at or below limit
+                if current_bar['low'] <= instruction.price:
+                    triggered = True
+                    execution_price = self._calculate_execution_price(instruction, current_bar)
+            else:  # SELL
+                # LIMIT SELL: Trigger when price goes at or above limit  
+                if current_bar['high'] >= instruction.price:
+                    triggered = True
+                    execution_price = self._calculate_execution_price(instruction, current_bar)
+                    
+        elif instruction.order_type == OrderType.STOP:
+            if instruction.direction == OrderDirection.BUY:
+                # STOP BUY: Trigger when price goes at or above stop
+                if current_bar['high'] >= instruction.stop_price:
+                    triggered = True
+                    execution_price = self._calculate_execution_price(instruction, current_bar)
+            else:  # SELL
+                # STOP SELL: Trigger when price goes at or below stop
+                if current_bar['low'] <= instruction.stop_price:
+                    triggered = True
+                    execution_price = self._calculate_execution_price(instruction, current_bar)
+                    
+        elif instruction.order_type == OrderType.STOP_LIMIT:
+            # Check only the stop condition - limit will be checked after conversion
+            if instruction.direction == OrderDirection.BUY:
+                # STOP_LIMIT BUY: Stop triggers when price goes at or above stop
+                if current_bar['high'] >= instruction.stop_price:
+                    triggered = True
+                    # Execution price not relevant here - will become LIMIT order
+            else:  # SELL
+                # STOP_LIMIT SELL: Stop triggers when price goes at or below stop
+                if current_bar['low'] <= instruction.stop_price:
+                    triggered = True
+                    # Execution price not relevant here - will become LIMIT order
+        
+        return triggered, execution_price
+
+    def _calculate_execution_price(self, instruction, current_bar) -> float:
+        """
+        Calculate actual execution price, handling gaps appropriately.
+        
+        Args:
+            instruction: TradeInstruction with price/stop_price
+            current_bar: Current bar OHLC data
+            
+        Returns:
+            float: Actual execution price
+        """
+        if instruction.order_type == OrderType.LIMIT:
+            target_price = instruction.price
+            
+            if instruction.direction == OrderDirection.BUY:
+                # LIMIT BUY: Execute at limit price or better (lower)
+                # Handle gap down: if bar low is better than limit, execute at open
+                if current_bar['open'] <= target_price:
+                    return current_bar['open']  # Gap down - better execution
+                else:
+                    return target_price  # Normal execution at limit
+            else:  # SELL
+                # LIMIT SELL: Execute at limit price or better (higher)  
+                # Handle gap up: if bar high is better than limit, execute at open
+                if current_bar['open'] >= target_price:
+                    return current_bar['open']  # Gap up - better execution
+                else:
+                    return target_price  # Normal execution at limit
+                    
+        elif instruction.order_type == OrderType.STOP:
+            # STOP orders execute at market price (with slippage)
+            market_price = current_bar['open']  # Conservative: assume triggered at open
+            
+            if instruction.direction == OrderDirection.BUY:
+                # Apply slippage: buy higher
+                return market_price * (1 + self.config.slippage_model)
+            else:  # SELL
+                # Apply slippage: sell lower
+                return market_price * (1 - self.config.slippage_model)
+        
+        # Fallback
+        return current_bar['open']
+
+    def _convert_stop_limit_to_limit(self, instruction):
+        """
+        Convert a triggered STOP_LIMIT order to a regular LIMIT order.
+        
+        Args:
+            instruction: STOP_LIMIT TradeInstruction
+            
+        Returns:
+            TradeInstruction: New LIMIT order
+        """
+        # Create new instruction as LIMIT order
+        from copy import deepcopy
+        new_instruction = deepcopy(instruction)
+        new_instruction.order_type = OrderType.LIMIT
+        # Keep the limit price, remove stop_price (though it won't be used)
+        
+        return new_instruction
+
+    def _execute_pending_order(self, instruction, execution_price: float, timestamp, current_bar_data: pd.DataFrame) -> bool:
+        """
+        Execute a triggered pending order with validation.
+        
+        Args:
+            instruction: TradeInstruction to execute
+            execution_price: Price to execute at
+            timestamp: Execution timestamp
+            current_bar_data: Current bar data for callbacks
+            
+        Returns:
+            bool: True if executed successfully, False if validation failed
+        """
+        try:
+            # Convert amount to quantity using execution price (current trigger price)
+            quantity = self._convert_amount_to_quantity(instruction, execution_price)
+            
+            # Validate the trade before execution
+            is_valid, error_msg = self.portfoliostate.validate_trade(
+                direction=instruction.direction,
+                quantity=quantity,
+                price=execution_price,
+                is_margin=instruction.is_margin,
+                leverage=instruction.leverage,
+                margin_requirement=instruction.margin_requirement,
+                commission_rate=self.config.commission_rate,
+                allow_short_selling=self.config.allow_short_selling,
+                require_margin_for_shorts=self.config.require_margin_for_shorts,
+                max_leverage=self.config.max_leverage
+            )
+            
+            if not is_valid:
+                logger.debug(f"Pending order validation failed: {error_msg}")
+                return False  # Keep order in pending queue
+            
+            # Execute the trade
+            if instruction.direction == OrderDirection.BUY:
+                position_id = self.portfoliostate.execute_buy(
+                    symbol=self.config.symbol,
+                    quantity=quantity,
+                    price=execution_price,
+                    timestamp=timestamp,
+                    is_margin=instruction.is_margin,
+                    leverage=instruction.leverage,
+                    margin_requirement=instruction.margin_requirement,
+                    take_profit=instruction.take_profit,
+                    exit_stop_loss=instruction.exit_stop_loss,
+                    exit_trailing_stop=instruction.exit_trailing_stop,
+                    exit_condition=instruction.exit_condition,
+                    exit_condition_frequency=getattr(instruction, 'exit_condition_frequency', 1),
+                    metadata=instruction.metadata,
+                    commission_rate=self.config.commission_rate,
+                    slippage_rate=0.0  # Already applied in execution_price calculation
+                )
+            else:  # SELL
+                position_id = self.portfoliostate.execute_sell(
+                    symbol=self.config.symbol,
+                    quantity=quantity,
+                    price=execution_price,
+                    timestamp=timestamp,
+                    is_margin=instruction.is_margin,
+                    leverage=instruction.leverage,
+                    margin_requirement=instruction.margin_requirement,
+                    take_profit=instruction.take_profit,
+                    exit_stop_loss=instruction.exit_stop_loss,
+                    exit_trailing_stop=instruction.exit_trailing_stop,
+                    exit_condition=instruction.exit_condition,
+                    exit_condition_frequency=getattr(instruction, 'exit_condition_frequency', 1),
+                    metadata=instruction.metadata,
+                    commission_rate=self.config.commission_rate,
+                    slippage_rate=0.0,  # Already applied in execution_price calculation
+                    allow_short_selling=self.config.allow_short_selling,
+                    require_margin_for_shorts=self.config.require_margin_for_shorts
+                )
+            
+            logger.info(f"Executed pending order: {instruction.direction.value} {quantity} {self.config.symbol} at {execution_price:.2f} → position {position_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to execute pending order: {e}")
+            self._handle_order_failure(instruction, str(e), current_bar_data)
+            return False
+    
+    def _compute_live_indicators(self, current_bar_data: pd.DataFrame, bar_index: int):
+        """
+        Compute non-precomputed indicators for the current bar.
+        
+        Args:
+            current_bar_data: All historical data up to current bar (view of self.data)
+            bar_index: Index of the current bar in the dataset
+        """
+        live_indicators = {
+            name: info for name, info in self.strategy.indicator_funcs.items() 
+            if not info.get('precompute', False)
+        }
+        
+        if not live_indicators:
+            return  # No live indicators to compute
+        
+        for name in live_indicators.keys():
+            if name not in current_bar_data.columns:
+                current_bar_data[name] = np.nan
+        
+        for name, info in live_indicators.items():
+            try:
+                if info.get('vectorized', False):
+                    logger.warning(f"Vectorized indicator '{name}' should be precomputed, computing anyway")
+                    indicator_values = info['func'](current_bar_data)
+                    current_bar_data[name] = indicator_values
+                else:
+                    indicator_value = info['func'](current_bar_data)
+                    
+                    col_idx = current_bar_data.columns.get_loc(name)
+                    current_bar_data.iat[bar_index, col_idx] = indicator_value
+                    
+                    logger.debug(f"Computed live indicator '{name}' for bar {bar_index}: {indicator_value}")
+                    
+            except Exception as e:
+                logger.error(f"Failed to compute live indicator '{name}' for bar {bar_index}: {e}")
+                col_idx = current_bar_data.columns.get_loc(name)
+                current_bar_data.iat[bar_index, col_idx] = np.nan
