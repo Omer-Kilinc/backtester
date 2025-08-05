@@ -227,13 +227,7 @@ class PerformanceAnalyzer:
         try:
             comparisons = {}
             
-            # Get strategy metrics from summary calculator (would need access to main metrics)
-            # For now, calculate key comparisons that make sense
-            
-            # Note: In a real implementation, we'd need the main strategy metrics here
-            # This is a simplified version showing the structure
-            
-            # Example comparisons (would need main strategy metrics to calculate)
+            # FIXME: Implement benchmark comparison
             comparisons['excess_return_vs_benchmark'] = 0.0  # main_return - benchmark_return
             comparisons['tracking_error'] = 0.0  # Std dev of (main_returns - benchmark_returns)
             comparisons['information_ratio'] = 0.0  # excess_return / tracking_error
