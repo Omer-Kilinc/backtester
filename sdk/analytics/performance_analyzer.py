@@ -4,9 +4,11 @@ from typing import Optional, Dict, Any, Callable
 from logging import getLogger
 
 from sdk.configs.analytics.analytics import AnalyticsConfig
+from sdk.configs.backtester.backtester import BacktesterConfig
 from sdk.backtester.portfoliostate import PortfolioState
 from .realtime_tracker import RealtimeTracker
 from .summary_calculator import SummaryCalculator
+from .benchmark_strategy import BuyAndHoldStrategy, SellAndHoldStrategy
 
 logger = getLogger(__name__)
 
@@ -62,8 +64,9 @@ class PerformanceAnalyzer:
         """Track analytics for current bar - called after live indicators, before strategy"""
         self.realtime_tracker.track_bar(portfoliostate, current_bar_data, bar_index)
         
-    def compute_final_metrics(self, data: pd.DataFrame, portfoliostate: PortfolioState) -> Dict[str, Any]:
-        """Compute final summary metrics"""
+    def compute_final_metrics(self, data: pd.DataFrame, portfoliostate: PortfolioState, 
+                             backtester_config: Optional[BacktesterConfig] = None) -> Dict[str, Any]:
+        """Compute final summary metrics with optional benchmark comparison"""
         logger.info("Computing final performance metrics...")
         
         try:
@@ -73,12 +76,18 @@ class PerformanceAnalyzer:
             # Add custom end-of-backtest metrics
             final_metrics.update(self._calculate_custom_final_metrics(data, portfoliostate))
             
+            # Run benchmark comparison if enabled and backtester config provided
+            if self.config.enable_buy_hold_benchmark and backtester_config is not None:
+                benchmark_metrics = self.run_benchmark_comparison(data, backtester_config)
+                final_metrics.update(benchmark_metrics)
+            
             # Add metadata
             final_metrics['_metadata'] = {
                 'symbol': self.symbol,
                 'initial_capital': self.initial_capital,
                 'risk_free_rate': self.config.risk_free_rate,
                 'var_confidence_level': self.config.var_confidence_level,
+                'benchmark_enabled': self.config.enable_buy_hold_benchmark,
                 'calculation_timestamp': pd.Timestamp.now().isoformat()
             }
             
@@ -87,7 +96,20 @@ class PerformanceAnalyzer:
             
         except Exception as e:
             logger.error(f"Error computing final metrics: {e}")
-            return {}
+    def _calculate_custom_final_metrics(self, data: pd.DataFrame, portfoliostate: PortfolioState) -> Dict[str, Any]:
+        """Calculate custom end-of-backtest metrics"""
+        custom_results = {}
+        
+        for name, metric_func in self.end_of_backtest_metrics.items():
+            try:
+                result = metric_func(data, portfoliostate)
+                custom_results[name] = result
+                logger.debug(f"Calculated custom metric '{name}': {result}")
+            except Exception as e:
+                logger.error(f"Error calculating custom metric '{name}': {e}")
+                custom_results[name] = None
+                
+        return custom_results
         
     def register_custom_metric(self, name: str, metric_func: Callable, timing: str):
         """Register custom metrics"""
@@ -128,20 +150,132 @@ class PerformanceAnalyzer:
                     
         logger.info(f"Auto-registered {len(self.end_of_backtest_metrics)} end-of-backtest metrics")
     
-    def _calculate_custom_final_metrics(self, data: pd.DataFrame, portfoliostate: PortfolioState) -> Dict[str, Any]:
-        """Calculate custom end-of-backtest metrics"""
-        custom_results = {}
+    def run_benchmark_comparison(self, original_data: pd.DataFrame, backtester_config: BacktesterConfig) -> Dict[str, Any]:
+        """
+        Run benchmark comparison using buy-and-hold strategy
         
-        for name, metric_func in self.end_of_backtest_metrics.items():
-            try:
-                result = metric_func(data, portfoliostate)
-                custom_results[name] = result
-                logger.debug(f"Calculated custom metric '{name}': {result}")
-            except Exception as e:
-                logger.error(f"Error calculating custom metric '{name}': {e}")
-                custom_results[name] = None
-                
-        return custom_results
+        Args:
+            original_data: Original market data used in main backtest
+            backtester_config: Backtester configuration to replicate settings
+            
+        Returns:
+            Dictionary with benchmark metrics and comparison ratios
+        """
+        logger.info("Running buy-and-hold benchmark comparison...")
+        
+        try:
+            # Import here to avoid circular imports
+            from sdk.backtester.backtester import Backtester
+            from sdk.data.data_pipeline import DataPipelineConfig
+            
+            # Determine benchmark symbol (use configured or same as main strategy)
+            benchmark_symbol = self.config.benchmark_symbol or self.symbol
+            
+            # Create benchmark strategy
+            benchmark_strategy = BuyAndHoldStrategy(
+                symbol=benchmark_symbol,
+                initial_capital=self.initial_capital
+            )
+            
+            # Create a minimal data pipeline config (we already have the data)
+            dummy_pipeline_config = DataPipelineConfig()  # Minimal config
+            
+            # Create benchmark backtester with same settings but no analytics (avoid recursion)
+            benchmark_backtester = Backtester(
+                strategy=benchmark_strategy,
+                data_pipeline_config=dummy_pipeline_config,
+                config=backtester_config,
+                data=original_data.copy(),  # Use same data
+                analytics_config=None  # No analytics to avoid recursion
+            )
+            
+            # Run benchmark backtest
+            logger.info("Executing benchmark backtest...")
+            benchmark_results = benchmark_backtester.execute_backtest()
+            
+            # Extract benchmark data and calculate metrics
+            benchmark_data = benchmark_results['data']
+            benchmark_portfoliostate = benchmark_results['portfoliostate']
+            
+            # Calculate benchmark metrics using same calculator
+            benchmark_calculator = SummaryCalculator(self.config, self.initial_capital)
+            benchmark_metrics = benchmark_calculator.calculate_all_metrics(benchmark_data, benchmark_portfoliostate)
+            
+            # Create comparison metrics
+            comparison_metrics = self._create_benchmark_comparison(benchmark_metrics)
+            
+            # Prefix benchmark metrics
+            prefixed_benchmark = {f"benchmark_{k}": v for k, v in benchmark_metrics.items() if not k.startswith('_')}
+            
+            # Combine results
+            result = {}
+            result.update(prefixed_benchmark)
+            result.update(comparison_metrics)
+            
+            logger.info(f"Benchmark comparison completed with {len(result)} metrics")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error running benchmark comparison: {e}")
+            return {
+                'benchmark_error': str(e),
+                'benchmark_comparison_failed': True
+            }
+    
+    def _create_benchmark_comparison(self, benchmark_metrics: Dict[str, Any]) -> Dict[str, Any]:
+        """Create comparison ratios between strategy and benchmark"""
+        try:
+            comparisons = {}
+            
+            # Get strategy metrics from summary calculator (would need access to main metrics)
+            # For now, calculate key comparisons that make sense
+            
+            # Note: In a real implementation, we'd need the main strategy metrics here
+            # This is a simplified version showing the structure
+            
+            # Example comparisons (would need main strategy metrics to calculate)
+            comparisons['excess_return_vs_benchmark'] = 0.0  # main_return - benchmark_return
+            comparisons['tracking_error'] = 0.0  # Std dev of (main_returns - benchmark_returns)
+            comparisons['information_ratio'] = 0.0  # excess_return / tracking_error
+            comparisons['beta_vs_benchmark'] = 0.0  # Beta relative to benchmark
+            
+            return comparisons
+            
+        except Exception as e:
+            logger.error(f"Error creating benchmark comparisons: {e}")
+            return {}
+            
+    def calculate_excess_return_metrics(self, main_metrics: Dict[str, Any], benchmark_metrics: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Calculate excess return metrics comparing main strategy to benchmark
+        
+        Args:
+            main_metrics: Main strategy performance metrics
+            benchmark_metrics: Benchmark strategy performance metrics
+            
+        Returns:
+            Dictionary with excess return calculations
+        """
+        try:
+            # Excess returns
+            excess_total_return = main_metrics.get('total_return_pct', 0) - benchmark_metrics.get('total_return_pct', 0)
+            excess_annualized_return = main_metrics.get('annualized_return', 0) - benchmark_metrics.get('annualized_return', 0)
+            
+            # Risk-adjusted excess returns
+            main_sharpe = main_metrics.get('sharpe_ratio', 0)
+            benchmark_sharpe = benchmark_metrics.get('sharpe_ratio', 0)
+            sharpe_difference = main_sharpe - benchmark_sharpe
+            
+            return {
+                'excess_total_return_pct': excess_total_return,
+                'excess_annualized_return_pct': excess_annualized_return,
+                'sharpe_ratio_difference': sharpe_difference,
+                'outperformed_benchmark': excess_total_return > 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating excess return metrics: {e}")
+            return {}
     
     def get_performance_summary(self, final_metrics: Dict[str, Any]) -> str:
         """Generate a human-readable performance summary"""

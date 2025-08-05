@@ -214,7 +214,7 @@ class Backtester:
 
         final_metrics = None
         if self.analytics:
-            final_metrics = self.analytics.compute_final_metrics(self.data, self.portfoliostate)
+            final_metrics = self.analytics.compute_final_metrics(self.data, self.portfoliostate, self.config)
             logger.info("Analytics calculations completed.")
             
             # Log performance summary
