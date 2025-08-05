@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 
 @dataclass
 class Position:
-    """Represents an active position in the portfolio with enhanced exit condition support"""
+    """Represents an active position in the portfolio"""
     symbol: str
     direction: OrderDirection
     quantity: float

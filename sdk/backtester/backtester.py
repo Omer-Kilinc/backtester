@@ -3,6 +3,8 @@ from sdk.configs.backtester.backtester import BacktesterConfig
 from sdk.strategy.base import Strategy
 from sdk.data.data_pipeline import DataPipelineConfig, DataPipeline
 from sdk.configs.backtester.tradeinstruction import OrderDirection, OrderType, FailureReason
+from sdk.configs.analytics.analytics import AnalyticsConfig
+from sdk.analytics.performance_analyzer import PerformanceAnalyzer
 from typing import TypeVar, Union, List, Dict, Any
 from logging import getLogger
 from sdk.strategy.registry import INDICATOR_REGISTRY
@@ -28,7 +30,8 @@ class Backtester:
         strategy: T, 
         data_pipeline_config: DataPipelineConfig, 
         config: BacktesterConfig, 
-        data: pd.DataFrame = None
+        data: pd.DataFrame = None,
+        analytics_config: Optional[AnalyticsConfig] = None
     ):
         """
         Initialize the backtester.
@@ -54,11 +57,19 @@ class Backtester:
             initial_capital=self.config.initial_capital,
             margin_requirement_rate=self.config.margin_requirement_rate
         )
+
+        self.analytics = None
+        if analytics_config:
+            # Assume strategy has symbol attribute - adjust if needed
+            symbol = getattr(strategy, 'symbol', 'UNKNOWN')
+            self.analytics = PerformanceAnalyzer(
+                config=analytics_config,
+                symbol=symbol,
+                initial_capital=config.initial_capital
+            )
         
-        # Order management
         self.queued_market_orders = {}  # Orders to execute at next bar open
         
-        # Supported exit condition actions
         self.SUPPORTED_ACTIONS = {
             'close': self._handle_close_action,
             'update_stop': self._handle_update_stop_action,
@@ -90,9 +101,52 @@ class Backtester:
         else:
             raise ValueError(f"Unexpected data type from pipeline: {type(result)}")
 
-    def execute_backtest(self):
+    def execute_backtest(self) -> Dict[str, Any]:
         """
-        Execute the backtest.
+        Execute the complete backtest workflow and return results.
+        
+        The backtest process includes:
+        1. Strategy initialization
+        2. Data preparation (if needed)
+        3. Indicator precomputation
+        4. Sequential bar processing:
+            - Market order execution
+            - Intrabar event processing
+            - Live indicator calculation
+            - Analytics tracking (if enabled)
+            - Trade instruction processing
+        5. Final metrics calculation (if analytics enabled)
+        6. Strategy cleanup
+    
+        Returns:
+            Dict[str, Any]: A dictionary containing:
+                - 'data' (pd.DataFrame): 
+                    The complete dataset including:
+                    - OHLCV prices
+                    - Calculated indicators
+                    - Analytics columns (if analytics enabled)
+                - 'portfoliostate' (PortfolioState): 
+                    Final portfolio state including:
+                    - Current positions
+                    - Cash balance
+                    - Portfolio metrics
+                - 'final_metrics' (Optional[StrategyMetrics]): 
+                    Performance metrics (None if analytics disabled), typically including:
+                    - Sharpe ratio
+                    - Max drawdown
+                    - Win rate
+                    - Other strategy metrics
+                - 'trade_history' (List[Trade]):
+                    Chronological list of all executed trades during backtest
+                    Each Trade object contains:
+                    - Entry/exit prices and timestamps
+                    - Position size
+                    - PnL
+                    - Metadata
+                - 'analytics' (PerformanceAnalyzer):
+                    Analytics object instance containing:
+                    - Final metrics
+                    - Performance summary
         """
         logger.info("Executing backtest...")
         self.strategy.on_init()
@@ -101,6 +155,11 @@ class Backtester:
             self.prepare_data()
 
         self.precompute_indicators(progress_log_freq=self.config.progress_log_freq)
+
+        if self.analytics:
+            self.analytics.initialize_data_columns(self.data)
+            # Auto-register decorated metrics from strategy
+            self.analytics.register_strategy_metrics(self.strategy)
         
         for i in range(len(self.data)):
             current_bar_data = self.data.iloc[:i+1]
@@ -113,6 +172,9 @@ class Backtester:
 
             # Compute live indicators for current bar before calling strategy
             self._compute_live_indicators(current_bar_data, i)
+
+            if self.analytics:
+                self.analytics.track_bar(self.portfoliostate, current_bar_data, i)
             
             # Call strategy to get new trade instructions (at bar close)
             trade_instructions = self.strategy.on_bar(current_bar_data)
@@ -121,8 +183,54 @@ class Backtester:
             if trade_instructions:
                 self._process_trade_instructions(trade_instructions, current_bar_data)
         
+        if self.portfoliostate.open_positions and len(self.data) > 0:
+            final_close_price = self.data.iloc[-1]['close']
+            final_timestamp = self.data.index[-1] if hasattr(self.data.index[-1], 'to_pydatetime') else pd.Timestamp.now()
+            
+            logger.info(f"Liquidating {len(self.portfoliostate.open_positions)} remaining positions...")
+            
+            # Get list of position IDs to avoid dict modification during iteration
+            positions_to_close = list(self.portfoliostate.open_positions.keys())
+            
+            for position_id in positions_to_close:
+                try:
+                    success = self.portfoliostate.liquidate_position(
+                        position_id=position_id,
+                        liquidation_price=final_close_price,
+                        reason="End of backtest liquidation",
+                        timestamp=final_timestamp,
+                        commission_rate=self.config.commission_rate
+                    )
+                    
+                    if success:
+                        logger.debug(f"Liquidated position {position_id} at {final_close_price:.2f}")
+                    else:
+                        logger.warning(f"Failed to liquidate position {position_id}")
+                        
+                except Exception as e:
+                    logger.error(f"Error liquidating position {position_id}: {e}")
+        
+        logger.info(f"End-of-backtest liquidation complete. Remaining positions: {len(self.portfoliostate.open_positions)}")
+
+        final_metrics = None
+        if self.analytics:
+            final_metrics = self.analytics.compute_final_metrics(self.data, self.portfoliostate)
+            logger.info("Analytics calculations completed.")
+            
+            # Log performance summary
+            summary = self.analytics.get_performance_summary(final_metrics)
+        logger.info(f"\n{summary}")
+
         logger.info("Backtest completed.")
         self.strategy.on_teardown()
+
+        return {
+            'data': self.data,  # DataFrame with OHLCV + indicators + analytics columns
+            'portfoliostate': self.portfoliostate,
+            'final_metrics': final_metrics,
+            'trade_history': self.portfoliostate.executed_trades,
+            'analytics': self.analytics
+        }
 
     def _process_intrabar_events(self, current_bar_data):
         """Process all intrabar events in priority order"""

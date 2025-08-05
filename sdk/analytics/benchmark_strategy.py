@@ -1,0 +1,2 @@
+class BuyAndHoldStrategy:
+    pass
