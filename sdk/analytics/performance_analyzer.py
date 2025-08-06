@@ -70,7 +70,7 @@ class PerformanceAnalyzer:
         logger.info("Computing final performance metrics...")
         
         try:
-            # Calculate core metrics
+            # Calculate core metrics for main strategy
             final_metrics = self.summary_calculator.calculate_all_metrics(data, portfoliostate)
             
             # Add custom end-of-backtest metrics
@@ -79,7 +79,13 @@ class PerformanceAnalyzer:
             # Run benchmark comparison if enabled and backtester config provided
             if self.config.enable_buy_hold_benchmark and backtester_config is not None:
                 benchmark_metrics = self.run_benchmark_comparison(data, backtester_config)
+                
+                # Now calculate actual comparison metrics with both main and benchmark data
+                comparison_metrics = self.calculate_excess_return_metrics(final_metrics, benchmark_metrics)
+                
+                # Add both benchmark and comparison metrics
                 final_metrics.update(benchmark_metrics)
+                final_metrics.update(comparison_metrics)
             
             # Add metadata
             final_metrics['_metadata'] = {
@@ -96,20 +102,7 @@ class PerformanceAnalyzer:
             
         except Exception as e:
             logger.error(f"Error computing final metrics: {e}")
-    def _calculate_custom_final_metrics(self, data: pd.DataFrame, portfoliostate: PortfolioState) -> Dict[str, Any]:
-        """Calculate custom end-of-backtest metrics"""
-        custom_results = {}
-        
-        for name, metric_func in self.end_of_backtest_metrics.items():
-            try:
-                result = metric_func(data, portfoliostate)
-                custom_results[name] = result
-                logger.debug(f"Calculated custom metric '{name}': {result}")
-            except Exception as e:
-                logger.error(f"Error calculating custom metric '{name}': {e}")
-                custom_results[name] = None
-                
-        return custom_results
+            return {}
         
     def register_custom_metric(self, name: str, metric_func: Callable, timing: str):
         """Register custom metrics"""
@@ -159,14 +152,13 @@ class PerformanceAnalyzer:
             backtester_config: Backtester configuration to replicate settings
             
         Returns:
-            Dictionary with benchmark metrics and comparison ratios
+            Dictionary with benchmark metrics (prefixed with 'benchmark_')
         """
         logger.info("Running buy-and-hold benchmark comparison...")
         
         try:
             # Import here to avoid circular imports
             from sdk.backtester.backtester import Backtester
-            from sdk.data.data_pipeline import DataPipelineConfig
             
             # Determine benchmark symbol (use configured or same as main strategy)
             benchmark_symbol = self.config.benchmark_symbol or self.symbol
@@ -177,19 +169,17 @@ class PerformanceAnalyzer:
                 initial_capital=self.initial_capital
             )
             
-            # Create a minimal data pipeline config (we already have the data)
-            dummy_pipeline_config = DataPipelineConfig()  # Minimal config
-            
             # Create benchmark backtester with same settings but no analytics (avoid recursion)
+            # Pass data directly and use None for data_pipeline_config since we're bypassing prepare_data()
             benchmark_backtester = Backtester(
                 strategy=benchmark_strategy,
-                data_pipeline_config=dummy_pipeline_config,
+                data_pipeline_config=None,  # Not needed since we pass data directly
                 config=backtester_config,
-                data=original_data.copy(),  # Use same data
+                data=original_data.copy(),  # Use same data - this bypasses prepare_data()
                 analytics_config=None  # No analytics to avoid recursion
             )
             
-            # Run benchmark backtest
+            # Run benchmark backtest (prepare_data() will be skipped since data is provided)
             logger.info("Executing benchmark backtest...")
             benchmark_results = benchmark_backtester.execute_backtest()
             
@@ -201,19 +191,11 @@ class PerformanceAnalyzer:
             benchmark_calculator = SummaryCalculator(self.config, self.initial_capital)
             benchmark_metrics = benchmark_calculator.calculate_all_metrics(benchmark_data, benchmark_portfoliostate)
             
-            # Create comparison metrics
-            comparison_metrics = self._create_benchmark_comparison(benchmark_metrics)
-            
-            # Prefix benchmark metrics
+            # Prefix benchmark metrics and return them
             prefixed_benchmark = {f"benchmark_{k}": v for k, v in benchmark_metrics.items() if not k.startswith('_')}
             
-            # Combine results
-            result = {}
-            result.update(prefixed_benchmark)
-            result.update(comparison_metrics)
-            
-            logger.info(f"Benchmark comparison completed with {len(result)} metrics")
-            return result
+            logger.info(f"Benchmark comparison completed with {len(prefixed_benchmark)} metrics")
+            return prefixed_benchmark
             
         except Exception as e:
             logger.error(f"Error running benchmark comparison: {e}")
@@ -222,43 +204,30 @@ class PerformanceAnalyzer:
                 'benchmark_comparison_failed': True
             }
     
-    def _create_benchmark_comparison(self, benchmark_metrics: Dict[str, Any]) -> Dict[str, Any]:
-        """Create comparison ratios between strategy and benchmark"""
-        try:
-            comparisons = {}
-            
-            # FIXME: Implement benchmark comparison
-            comparisons['excess_return_vs_benchmark'] = 0.0  # main_return - benchmark_return
-            comparisons['tracking_error'] = 0.0  # Std dev of (main_returns - benchmark_returns)
-            comparisons['information_ratio'] = 0.0  # excess_return / tracking_error
-            comparisons['beta_vs_benchmark'] = 0.0  # Beta relative to benchmark
-            
-            return comparisons
-            
-        except Exception as e:
-            logger.error(f"Error creating benchmark comparisons: {e}")
-            return {}
-            
     def calculate_excess_return_metrics(self, main_metrics: Dict[str, Any], benchmark_metrics: Dict[str, Any]) -> Dict[str, float]:
         """
         Calculate excess return metrics comparing main strategy to benchmark
         
         Args:
             main_metrics: Main strategy performance metrics
-            benchmark_metrics: Benchmark strategy performance metrics
+            benchmark_metrics: Benchmark strategy performance metrics (with 'benchmark_' prefix)
             
         Returns:
             Dictionary with excess return calculations
         """
         try:
-            # Excess returns
-            excess_total_return = main_metrics.get('total_return_pct', 0) - benchmark_metrics.get('total_return_pct', 0)
-            excess_annualized_return = main_metrics.get('annualized_return', 0) - benchmark_metrics.get('annualized_return', 0)
+            # Extract benchmark values (remove 'benchmark_' prefix for comparison)
+            bench_total_return = benchmark_metrics.get('benchmark_total_return_pct', 0)
+            bench_annualized_return = benchmark_metrics.get('benchmark_annualized_return', 0)
+            bench_sharpe = benchmark_metrics.get('benchmark_sharpe_ratio', 0)
+            
+            # Calculate excess returns
+            excess_total_return = main_metrics.get('total_return_pct', 0) - bench_total_return
+            excess_annualized_return = main_metrics.get('annualized_return', 0) - bench_annualized_return
             
             # Risk-adjusted excess returns
             main_sharpe = main_metrics.get('sharpe_ratio', 0)
-            benchmark_sharpe = benchmark_metrics.get('sharpe_ratio', 0)
-            sharpe_difference = main_sharpe - benchmark_sharpe
+            sharpe_difference = main_sharpe - bench_sharpe
             
             return {
                 'excess_total_return_pct': excess_total_return,
@@ -270,6 +239,21 @@ class PerformanceAnalyzer:
         except Exception as e:
             logger.error(f"Error calculating excess return metrics: {e}")
             return {}
+    
+    def _calculate_custom_final_metrics(self, data: pd.DataFrame, portfoliostate: PortfolioState) -> Dict[str, Any]:
+        """Calculate custom end-of-backtest metrics"""
+        custom_results = {}
+        
+        for name, metric_func in self.end_of_backtest_metrics.items():
+            try:
+                result = metric_func(data, portfoliostate)
+                custom_results[name] = result
+                logger.debug(f"Calculated custom metric '{name}': {result}")
+            except Exception as e:
+                logger.error(f"Error calculating custom metric '{name}': {e}")
+                custom_results[name] = None
+                
+        return custom_results
     
     def get_performance_summary(self, final_metrics: Dict[str, Any]) -> str:
         """Generate a human-readable performance summary"""
@@ -301,9 +285,19 @@ class PerformanceAnalyzer:
                 f"  Win Rate: {final_metrics.get('win_rate', 0):.2f}%",
                 f"  Profit Factor: {final_metrics.get('profit_factor', 0):.3f}",
                 f"  Expectancy: ${final_metrics.get('expectancy', 0):.2f}",
-                "=" * 50
             ]
             
+            # Add benchmark comparison if available
+            if 'benchmark_total_return_pct' in final_metrics:
+                summary_lines.extend([
+                    "",
+                    "BENCHMARK COMPARISON:",
+                    f"  Benchmark Return: {final_metrics.get('benchmark_total_return_pct', 0):.2f}%",
+                    f"  Excess Return: {final_metrics.get('excess_total_return_pct', 0):.2f}%",
+                    f"  Outperformed: {final_metrics.get('outperformed_benchmark', False)}"
+                ])
+            
+            summary_lines.append("=" * 50)
             return "\n".join(summary_lines)
             
         except Exception as e:
